@@ -1,0 +1,10 @@
+[package]
+name = "rustos-interrupts"
+version = "0.1.0"
+edition = "2021"
+description = "no_std interrupt plumbing for a Rust OS: 8259 PIC, PIT timer, local APIC / IOAPIC, IDT layout, handler dispatch"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rustos_interrupts"
+path = "src/lib.rs"
