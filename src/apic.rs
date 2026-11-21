@@ -183,6 +183,18 @@ impl<R: RegWindow> LocalApic<R> {
         let cur = self.regs.read(lapic::LVT_TIMER);
         self.regs.write(lapic::LVT_TIMER, cur | LVT_MASKED);
     }
+
+    /// Mask LINT0 (the ExtINT pin the PIC normally drives).
+    pub fn mask_lint0(&mut self) {
+        let cur = self.regs.read(lapic::LVT_LINT0);
+        self.regs.write(lapic::LVT_LINT0, cur | LVT_MASKED);
+    }
+
+    /// Mask LINT1 (the NMI pin).
+    pub fn mask_lint1(&mut self) {
+        let cur = self.regs.read(lapic::LVT_LINT1);
+        self.regs.write(lapic::LVT_LINT1, cur | LVT_MASKED);
+    }
 }
 
 // ---- IOAPIC -----------------------------------------------------------
@@ -315,11 +327,109 @@ impl<R: RegWindow> IoApic<R> {
         self.set_redirection_entry(n, low, redirection_entry_high(dest_apic_id));
     }
 
+    /// Route IRQ `n` to `vector` like [`IoApic::route_irq`], but leave
+    /// the entry masked: the IRQ is programmed but cannot fire yet.
+    /// Used by [`init_apic`] so the IOAPIC is ready before delivery
+    /// switches to it (see [`switch_to_apic`]).
+    pub fn route_irq_masked(&mut self, n: u32, vector: u8, dest_apic_id: u8) {
+        let low = redirection_entry_low(vector, DELIVERY_FIXED, 0, 0, 0, true);
+        self.set_redirection_entry(n, low, redirection_entry_high(dest_apic_id));
+    }
+
     /// Mask redirection entry `n` (stops that IRQ reaching any CPU).
     pub fn mask_irq(&mut self, n: u32) {
         let (low, high) = self.redirection_entry(n);
         self.set_redirection_entry(n, low | (1 << 16), high);
     }
+
+    /// Unmask redirection entry `n` (lets that IRQ reach the CPU).
+    pub fn unmask_irq(&mut self, n: u32) {
+        let (low, high) = self.redirection_entry(n);
+        self.set_redirection_entry(n, low & !(1 << 16), high);
+    }
+}
+
+// ---- Controller mode: PIC vs APIC -----------------------------------
+
+use crate::idt::{KEYBOARD_VECTOR, TIMER_VECTOR};
+use crate::pic::{Pic, IRQ_KEYBOARD, IRQ_TIMER};
+use crate::ports::PortIo;
+
+/// Spurious-interrupt vector used when enabling the local APIC
+/// (conventional choice; outside the PIC's 32–47 range).
+pub const APIC_SPURIOUS_VECTOR: u8 = 0xFF;
+
+/// Which controller delivers hardware IRQs to the CPU. Exactly one
+/// owns IRQ0/IRQ1 at a time — never both, or an interrupt would be
+/// delivered twice (once via the PIC, once via the IOAPIC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerMode {
+    /// 8259 PIC pair (remapped to vectors 32–47). The boot path.
+    Pic,
+    /// Local APIC + IOAPIC (IRQ0 -> vector 32, IRQ1 -> vector 33).
+    Apic,
+}
+
+/// Initialise the APIC side of interrupt delivery.
+///
+/// * Enables the local APIC with spurious vector `0xFF`.
+/// * Masks the APIC timer (the PIT is the timer), LINT0 (ExtINT) and
+///   LINT1 (NMI pin) — nothing on the LAPIC fires on its own.
+/// * Programs the IOAPIC redirection entries for IRQ0 (timer ->
+///   vector 32) and IRQ1 (keyboard -> vector 33) on `dest_apic_id`,
+///   but leaves them **masked**.
+///
+/// Delivery stays with the PIC after this call: the IOAPIC entries
+/// are programmed but cannot fire, so there is no double delivery.
+/// Call [`switch_to_apic`] to hand IRQ ownership to the IOAPIC (it
+/// masks the PIC and unmasks the two entries together), or
+/// [`switch_to_pic`] to hand it back.
+///
+/// The caller must have mapped the APIC MMIO pages first and handed
+/// the LAPIC/IOAPIC their (default) bases: `0xFEE00000` /
+/// `0xFEC00000`. Those bases are **not** discovered from ACPI/MADT
+/// and the APIC base is **not** read from the IA32_APIC_BASE MSR —
+/// see the crate README. On hardware where the bases differ, this
+/// writes to the wrong addresses.
+pub fn init_apic<R1: RegWindow, R2: RegWindow>(
+    lapic: &mut LocalApic<R1>,
+    ioapic: &mut IoApic<R2>,
+    dest_apic_id: u8,
+) {
+    lapic.enable(APIC_SPURIOUS_VECTOR);
+    lapic.timer_mask();
+    lapic.mask_lint0();
+    lapic.mask_lint1();
+    ioapic.route_irq_masked(0, TIMER_VECTOR, dest_apic_id);
+    ioapic.route_irq_masked(1, KEYBOARD_VECTOR, dest_apic_id);
+}
+
+/// Hand IRQ delivery from the PIC to the IOAPIC, atomically as far as
+/// the two controllers allow: mask every PIC line first (so the PIC
+/// cannot deliver while the IOAPIC is being unmasked), then unmask
+/// the IOAPIC entries for IRQ0 and IRQ1. After this, EOI for vectors
+/// 32–47 goes to the local APIC, not the PIC.
+pub fn switch_to_apic<P: PortIo, R: RegWindow>(
+    pic: &mut Pic<P>,
+    ioapic: &mut IoApic<R>,
+) {
+    pic.mask_all();
+    ioapic.unmask_irq(0);
+    ioapic.unmask_irq(1);
+}
+
+/// Hand IRQ delivery back from the IOAPIC to the PIC: mask the
+/// IOAPIC entries for IRQ0 and IRQ1 first, then unmask those two
+/// lines on the PIC. After this, EOI for vectors 32–47 goes to the
+/// PIC again.
+pub fn switch_to_pic<P: PortIo, R: RegWindow>(
+    pic: &mut Pic<P>,
+    ioapic: &mut IoApic<R>,
+) {
+    ioapic.mask_irq(0);
+    ioapic.mask_irq(1);
+    pic.unmask_irq(IRQ_TIMER);
+    pic.unmask_irq(IRQ_KEYBOARD);
 }
 
 #[cfg(test)]
@@ -415,5 +525,65 @@ mod tests {
         assert_eq!(io.redirection_entry(0).0, 0x20);
         assert_eq!(io.redirection_entry(1).0, 0x21);
         assert_eq!(io.redirection_entry(2).0, 0x22);
+    }
+
+    #[test]
+    fn init_apic_enables_lapic_and_routes_irqs_masked() {
+        let mut lapic = LocalApic::new(MockRegWindow::new());
+        let mut ioapic = IoApic::new(MockIoApicWindow::new());
+        init_apic(&mut lapic, &mut ioapic, 0x00);
+        // LAPIC enabled with spurious vector 0xFF; timer + LINTs masked.
+        assert_eq!(
+            lapic.regs.get(lapic::SPURIOUS),
+            SPURIOUS_ENABLE | APIC_SPURIOUS_VECTOR as u32
+        );
+        assert_eq!(lapic.regs.get(lapic::LVT_TIMER) & LVT_MASKED, LVT_MASKED);
+        assert_eq!(lapic.regs.get(lapic::LVT_LINT0) & LVT_MASKED, LVT_MASKED);
+        assert_eq!(lapic.regs.get(lapic::LVT_LINT1) & LVT_MASKED, LVT_MASKED);
+        // IRQ0 -> vector 32, IRQ1 -> vector 33, both still masked.
+        let (low0, high0) = ioapic.redirection_entry(0);
+        let (low1, high1) = ioapic.redirection_entry(1);
+        assert_eq!(low0, 32 | (1 << 16));
+        assert_eq!(high0, 0);
+        assert_eq!(low1, 33 | (1 << 16));
+        assert_eq!(high1, 0);
+    }
+
+    #[test]
+    fn mode_switch_hands_irq_ownership_pic_to_apic_and_back() {
+        use crate::pic::{Pic, PIC1_DATA, PIC2_DATA};
+        use crate::ports::MockPorts;
+
+        let mut ports = MockPorts::new();
+        ports.set(PIC1_DATA, 0xFC); // timer + keyboard unmasked
+        ports.set(PIC2_DATA, 0xFF);
+        let mut pic = Pic::new(ports);
+        pic.remap_default(); // boot path: remap reads the preset masks
+        let mut ioapic = IoApic::new(MockIoApicWindow::new());
+        init_apic(
+            &mut LocalApic::new(MockRegWindow::new()),
+            &mut ioapic,
+            0x00,
+        );
+
+        // PIC owns the IRQs: entries masked, PIC lines open.
+        assert_eq!(ioapic.redirection_entry(0).0 & (1 << 16), 1 << 16);
+        assert!(!pic.is_masked(crate::pic::IRQ_TIMER));
+        assert!(!pic.is_masked(crate::pic::IRQ_KEYBOARD));
+
+        // Switch to APIC: PIC fully masked, IOAPIC entries unmasked.
+        switch_to_apic(&mut pic, &mut ioapic);
+        assert_eq!(pic.mask1(), 0xFF);
+        assert_eq!(pic.mask2(), 0xFF);
+        assert_eq!(ioapic.redirection_entry(0).0, 32);
+        assert_eq!(ioapic.redirection_entry(1).0, 33);
+
+        // Switch back: IOAPIC masked again, only IRQ0/IRQ1 open on PIC.
+        switch_to_pic(&mut pic, &mut ioapic);
+        assert_eq!(ioapic.redirection_entry(0).0 & (1 << 16), 1 << 16);
+        assert_eq!(ioapic.redirection_entry(1).0 & (1 << 16), 1 << 16);
+        assert!(!pic.is_masked(crate::pic::IRQ_TIMER));
+        assert!(!pic.is_masked(crate::pic::IRQ_KEYBOARD));
+        assert!(pic.is_masked(3)); // other PIC lines stay masked
     }
 }

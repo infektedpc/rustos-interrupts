@@ -8,7 +8,9 @@ abstraction, and tests use in-memory mocks.
 |---|---|---|
 | `pic` | 8259 PIC pair, 0x20/0x21 + 0xA0/0xA1 | remap to vectors 32–47, mask/unmask, EOI, spurious-IRQ detection |
 | `pit` | PIT 8253/8254, channel 0, 1_193_182 Hz | divisor math (identical to `rustos-drivers::pit`), `PitTimer` quantum grouping |
-| `apic` | Local APIC 0xFEE00000, IOAPIC 0xFEC00000 | register offsets, timer (one-shot/periodic), EOI, redirection entries |
+| `timer` | IRQ0 handler state | `TimerIrq`: advances the `PitTimer`, runs the scheduler tick only at quantum boundaries |
+| `keyboard` | IRQ1 handler state | PS/2 set-1 decode (`KeyboardDecoder`) into a 64-entry `KeyRing` |
+| `apic` | Local APIC 0xFEE00000, IOAPIC 0xFEC00000 | register offsets, timer (one-shot/periodic), EOI, redirection entries, `init_apic` + PIC↔APIC mode switch |
 | `idt` | IDT entry layout (16 bytes), vector map | exception vectors 0–31, PIC 32–47, APIC 48+, handler registry |
 | `handler` | Dispatch: vector → handler → EOI | routes EOI to PIC or APIC, spurious-vector handling |
 | `ports` | `PortIo` trait, `MockPorts`, `RealPorts` (x86_64) | same contract as `rustos-drivers::ports`, self-contained |
@@ -28,25 +30,73 @@ abstraction, and tests use in-memory mocks.
 
 ## How the timer IRQ drives the scheduler tick
 
-The PIT fires IRQ0 (vector 32) at the programmed rate — 100 Hz is
-the usual choice (`pit::divisor_for_hz(100)` = 11931). The kernel's
-vector-32 stub calls `handler::dispatch(32, table, eoi)`, and the
-registered handler does:
+The PIT fires IRQ0 (vector 32) at the programmed rate — 100 Hz in
+the kernel (`pit::init(ports, 100)`). The kernel's vector-32 stub
+calls `TimerIrq::handle_irq_with`, which advances the `PitTimer` and
+runs the scheduler tick **only at a quantum boundary**:
 
 ```rust
-// in the kernel's timer handler (pseudo-code):
-fn timer_handler(_vector: u8) {
-    // PIT_TIMER is a `PitTimer` with, say, 10 ticks per quantum.
-    if PIT_TIMER.on_tick() == TickOutcome::QuantumElapsed {
-        scheduler::tick(); // pre-empt the current task (rustos-scheduler)
-    }
+// in the kernel's timer handler:
+let outcome = TIMER_IRQ.handle_irq_with(|| SCHEDULER.tick());
+if let Some(TickOutcome::Preempt(next)) = outcome {
+    NEED_RESCHED.store(next.0); // the idle loop switches, not the IRQ
 }
 ```
 
-So the scheduler runs once per quantum (100 ms at 100 Hz / 10 ticks),
-not once per PIT tick. `PitTimer` keeps the count; the scheduler
-itself lives in `rustos-scheduler` — this crate only owns the
-interrupt side and never depends on it.
+Quantum size: the scheduler's timeslice is 10 ms, so at 100 Hz one
+PIT tick *is* one quantum (`ticks_per_timeslice(100) == 1`) and the
+kernel builds its `TimerIrq` with `quantum_ticks = 1` — `tick()` runs
+on every interrupt. At 1000 Hz the same code uses `quantum_ticks = 10`
+and the tick runs every tenth interrupt. The `PitTimer` default
+(10) is the 1000 Hz case. There is no second layer of quanta on top
+of the scheduler's own: `TimerIrq` groups PIT ticks into quanta and
+`Scheduler::tick()` charges one quantum per call.
+
+EOI goes to the PIC in PIC mode (master only for IRQ0) or to the
+LAPIC in APIC mode — see the mode section below. The switch to the
+next task never happens inside the interrupt handler: the handler
+records the `Preempt` decision and the kernel's idle loop performs
+the register switch on its own stack.
+
+## How the keyboard IRQ works
+
+IRQ1 (vector 33) fires when the PS/2 controller has a byte ready.
+The kernel's vector-33 stub calls `KeyboardIrq::on_irq`, which
+reads the scancode from port `0x60`, decodes it with
+`KeyboardDecoder`, and pushes a `KeyEvent` into a 64-entry ring
+buffer the kernel drains from its idle loop:
+
+- make/break for every key (`pressed`), `0xE0` extended keys
+  (arrows, Insert/Delete, …) with `extended = true` and no
+  character, `0xF0` break-prefix form as well as the set-1
+  high-bit break form;
+- Shift (left/right) tracked, Caps Lock toggles on make;
+- printable character in `ch` on make only, using the same
+  scancode table as `rustos-drivers::keyboard` (kept in sync by
+  hand — if the table changes, change it in both places).
+
+A full ring drops the *event* (counted in `KeyRing::dropped`) but
+the byte is still consumed and EOI is still sent, so the controller
+never wedges.
+
+## PIC mode vs APIC mode
+
+Exactly one controller owns IRQ0/IRQ1 at a time — never both, or
+an interrupt would be delivered twice.
+
+- **PIC mode (the boot path).** `Pic::remap_default()` moves the
+  8259s to vectors 32–47, IRQ0/IRQ1 are unmasked, EOI goes to the
+  PIC. `init_apic` is still run at boot (LAPIC enabled, spurious
+  vector `0xFF`, APIC timer + LINT0/LINT1 masked), but the IOAPIC
+  redirection entries for IRQ0/IRQ1 are programmed **masked**, so
+  they cannot fire.
+- **APIC mode.** `switch_to_apic(pic, ioapic)` masks every PIC
+  line first, then unmasks the IOAPIC entries for IRQ0/IRQ1; EOI
+  for vectors 32–47 goes to the LAPIC from then on.
+  `switch_to_pic` reverses it (mask IOAPIC entries, unmask IRQ0/1
+  on the PIC). The kernel exposes this as
+  `interrupts::switch_to_apic_mode()`, which is **not** called at
+  boot — the switch is untested on real hardware.
 
 ## Wiring it into the kernel
 
@@ -74,9 +124,11 @@ table.register(TIMER_VECTOR, timer_handler);
 //    writing the spurious vector + enable bit — see `apic::LocalApic`.
 ```
 
-The existing `rustos-kernel` IDT only serves CPU exceptions until
-this step is done: its `interrupts.rs` notes the PICs were not
-remapped yet, which is exactly what `Pic::remap_default` fixes.
+The `rustos-kernel` now does exactly this in `interrupts.rs`:
+its IDT has vector-32 (timer) and vector-33 (keyboard) handlers,
+`init_interrupts()` runs the PIC remap + PIT init + APIC init at
+boot, unmasks IRQ0/IRQ1, and enables interrupts — then its idle
+loop drains the keyboard ring and acts on timer preempt requests.
 
 ## Build / test
 
@@ -88,21 +140,26 @@ cargo test
 ## Limitations
 
 - **Not live-boot-tested.** QEMU is not installed on this VM, so the
-  PIC remap sequence, APIC timer and dispatch have only been verified
-  against `MockPorts` / `MockRegWindow` — the register writes are
-  asserted byte-for-byte, but no real hardware has run them yet.
+  PIC remap sequence, APIC init, timer/keyboard handlers and dispatch
+  have only been verified against `MockPorts` / `MockRegWindow` — the
+  register writes are asserted byte-for-byte, but no real hardware has
+  run them yet. The PIC -> APIC mode switch in particular is
+  untested on hardware; the kernel boots in PIC mode.
 - No MSI/MSI-X support.
-- No IOAPIC redirection-table programming on real hardware yet: the
-  entry builder (`redirection_entry_low/high`, `IoApic::route_irq`)
-  is host-tested, but no kernel wires it to a live IOAPIC, and the
-  bases are not discovered from ACPI/MADT (they default to
-  0xFEE00000 / 0xFEC00000).
+- No ACPI/MADT discovery: the APIC bases are not discovered, they
+  default to 0xFEE00000 / 0xFEC00000, and the IOAPIC entries are
+  programmed from those defaults. On hardware where the bases differ,
+  `init_apic` writes to the wrong addresses.
 - No APIC-base MSR read; `LocalApic` trusts the caller to hand it a
   mapped `VolatileRegWindow`.
 - The PIT divisor math is deliberately duplicated from
   `rustos-drivers::pit` (both crates are standalone, no sibling
   dependency) — if the math ever changes, change it in both places;
   the tests in both crates assert the same values (100 Hz → 11931).
+- The scancode table is deliberately duplicated from
+  `rustos-drivers::keyboard` (this crate yields full key events,
+  the drivers crate yields printable characters) — if the table
+  ever changes, change it in both places.
 - `PitTimer` counts ticks; it does not calibrate the APIC timer
   against the PIT, which is how a real kernel derives the APIC bus
   frequency.
